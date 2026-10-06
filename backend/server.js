@@ -13,6 +13,32 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+let sseClients = [];
+
+function broadcastChange(type, data) {
+  const message = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(message);
+    } catch {
+      // ignore broken client
+    }
+  }
+}
+
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  sseClients.push(res);
+
+  req.on('close', () => {
+    sseClients = sseClients.filter((c) => c !== res);
+  });
+});
+
 function formatRoom(row) {
   return {
     id: row.id,
@@ -218,7 +244,9 @@ app.post('/api/bookings', async (req, res) => {
 
     await client.query('COMMIT');
     const newBooking = { ...insertResult.rows[0], room_name: room.name };
-    res.status(201).json(formatBooking(newBooking));
+    const formatted = formatBooking(newBooking);
+    broadcastChange('booking_created', formatted);
+    res.status(201).json(formatted);
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
@@ -294,9 +322,11 @@ app.delete('/api/bookings/:id', async (req, res) => {
 
     await client.query('COMMIT');
     const updated = { ...updateResult.rows[0], room_name: booking.room_name };
+    const formatted = formatBooking(updated);
+    broadcastChange('booking_cancelled', formatted);
     res.status(200).json({
       message: 'Booking cancelled successfully.',
-      booking: formatBooking(updated)
+      booking: formatted
     });
   } catch (err) {
     await client.query('ROLLBACK');

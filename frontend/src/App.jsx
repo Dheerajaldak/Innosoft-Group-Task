@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import './App.css';
 
 const TIME_SLOTS = [];
@@ -22,7 +22,11 @@ function getTodayUtcString() {
 function App() {
   const [rooms, setRooms] = useState([]);
   const [loadingRooms, setLoadingRooms] = useState(true);
-  const [selectedDate, setSelectedDate] = useState(getTodayUtcString());
+
+  const [selectedDate, setSelectedDate] = useState(() => {
+    return localStorage.getItem('meeting_room_selected_date') || getTodayUtcString();
+  });
+
   const [bookings, setBookings] = useState([]);
   const [loadingBookings, setLoadingBookings] = useState(false);
   const [globalMessage, setGlobalMessage] = useState('');
@@ -31,7 +35,9 @@ function App() {
   const [formTitle, setFormTitle] = useState('');
   const [formEmail, setFormEmail] = useState('');
   const [formAttendees, setFormAttendees] = useState(1);
-  const [formDate, setFormDate] = useState(getTodayUtcString());
+  const [formDate, setFormDate] = useState(() => {
+    return localStorage.getItem('meeting_room_selected_date') || getTodayUtcString();
+  });
   const [formStart, setFormStart] = useState('09:00');
   const [formEnd, setFormEnd] = useState('10:00');
   const [formClientError, setFormClientError] = useState('');
@@ -41,14 +47,15 @@ function App() {
   const [confirmCancelId, setConfirmCancelId] = useState(null);
   const [cancelLoading, setCancelLoading] = useState(false);
 
-  const [searchDate, setSearchDate] = useState(getTodayUtcString());
+  const [searchDate, setSearchDate] = useState(() => {
+    return localStorage.getItem('meeting_room_selected_date') || getTodayUtcString();
+  });
   const [searchStart, setSearchStart] = useState('09:00');
   const [searchEnd, setSearchEnd] = useState('10:00');
   const [searchMinCapacity, setSearchMinCapacity] = useState(1);
   const [searchResults, setSearchResults] = useState(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState('');
-
 
   const fetchBookings = useCallback(async (date) => {
     setLoadingBookings(true);
@@ -66,8 +73,12 @@ function App() {
   }, []);
 
   useEffect(() => {
+    localStorage.setItem('meeting_room_selected_date', selectedDate);
+  }, [selectedDate]);
+
+  useEffect(() => {
     let ignore = false;
-    const loadInitialRooms = async () => {
+    const loadRooms = async () => {
       try {
         const res = await fetch('http://localhost:5000/api/rooms');
         const data = await res.json();
@@ -85,38 +96,82 @@ function App() {
         }
       }
     };
-    loadInitialRooms();
+    loadRooms();
     return () => {
       ignore = true;
     };
   }, []);
 
   useEffect(() => {
-    if (!selectedDate) return;
     let ignore = false;
     const loadDayBookings = async () => {
-      setLoadingBookings(true);
-      try {
-        const res = await fetch(`http://localhost:5000/api/bookings?date=${selectedDate}`);
-        const data = await res.json();
-        if (!ignore && Array.isArray(data)) {
-          setBookings(data);
-        }
-      } catch {
-        if (!ignore) {
-          setGlobalMessage('Failed to load bookings for selected day.');
-        }
-      } finally {
-        if (!ignore) {
-          setLoadingBookings(false);
-        }
+      if (selectedDate && !ignore) {
+        fetchBookings(selectedDate);
       }
     };
     loadDayBookings();
     return () => {
       ignore = true;
     };
-  }, [selectedDate]);
+  }, [selectedDate, fetchBookings]);
+
+  useEffect(() => {
+    const eventSource = new EventSource('http://localhost:5000/api/events');
+
+    eventSource.addEventListener('booking_created', () => {
+      if (selectedDate) {
+        fetchBookings(selectedDate);
+      }
+    });
+
+    eventSource.addEventListener('booking_cancelled', () => {
+      if (selectedDate) {
+        fetchBookings(selectedDate);
+      }
+    });
+
+    const intervalId = setInterval(() => {
+      if (selectedDate) {
+        fetchBookings(selectedDate);
+      }
+    }, 5000);
+
+    return () => {
+      eventSource.close();
+      clearInterval(intervalId);
+    };
+  }, [selectedDate, fetchBookings]);
+
+  const selectedRoomObj = useMemo(() => {
+    return rooms.find((r) => String(r.id) === String(formRoomId)) || null;
+  }, [rooms, formRoomId]);
+
+  const formRoomBookings = useMemo(() => {
+    if (formDate !== selectedDate) return [];
+    return bookings.filter((b) => String(b.roomId) === String(formRoomId));
+  }, [bookings, formRoomId, formDate, selectedDate]);
+
+  const liveOverlapConflict = useMemo(() => {
+    if (formDate !== selectedDate) return null;
+    const selectedStartMs = new Date(`${formDate}T${formStart}:00.000Z`).getTime();
+    const selectedEndMs = new Date(`${formDate}T${formEnd}:00.000Z`).getTime();
+    if (selectedEndMs <= selectedStartMs) return null;
+
+    for (const b of formRoomBookings) {
+      const bStartMs = new Date(b.start).getTime();
+      const bEndMs = new Date(b.end).getTime();
+      if (selectedStartMs < bEndMs && bStartMs < selectedEndMs) {
+        return b;
+      }
+    }
+    return null;
+  }, [formRoomBookings, formDate, selectedDate, formStart, formEnd]);
+
+  const capacityExceeded = useMemo(() => {
+    if (!selectedRoomObj) return false;
+    const num = parseInt(formAttendees, 10);
+    return !isNaN(num) && num > selectedRoomObj.capacity;
+  }, [selectedRoomObj, formAttendees]);
 
   const handleCreateBooking = async (e) => {
     e.preventDefault();
@@ -151,9 +206,8 @@ function App() {
       return;
     }
 
-    const selectedRoom = rooms.find((r) => String(r.id) === String(formRoomId));
-    if (selectedRoom && attendeesNum > selectedRoom.capacity) {
-      setFormClientError(`Attendees (${attendeesNum}) exceed capacity (${selectedRoom.capacity}) for ${selectedRoom.name}.`);
+    if (selectedRoomObj && attendeesNum > selectedRoomObj.capacity) {
+      setFormClientError(`Attendees (${attendeesNum}) exceed capacity (${selectedRoomObj.capacity}) for ${selectedRoomObj.name}.`);
       return;
     }
 
@@ -184,6 +238,11 @@ function App() {
       return;
     }
 
+    if (liveOverlapConflict) {
+      setFormClientError(`Cannot book: Room is already booked from ${liveOverlapConflict.start.slice(11, 16)} to ${liveOverlapConflict.end.slice(11, 16)} UTC.`);
+      return;
+    }
+
     setFormSubmitting(true);
     try {
       const res = await fetch('http://localhost:5000/api/bookings', {
@@ -204,7 +263,7 @@ function App() {
         setFormServerError(data.error?.message || 'Failed to create booking.');
       } else {
         setFormTitle('');
-        setGlobalMessage(`Booking "${data.title}" successfully confirmed.`);
+        setGlobalMessage(`Booking "${data.title}" successfully confirmed in real time.`);
         if (selectedDate === formDate) {
           fetchBookings(selectedDate);
         } else {
@@ -275,17 +334,21 @@ function App() {
   const handleSelectSearchedRoom = (room) => {
     setFormRoomId(room.id);
     setFormDate(searchDate);
+    setSelectedDate(searchDate);
     setFormStart(searchStart);
     setFormEnd(searchEnd);
     setFormAttendees(searchMinCapacity);
-    window.scrollTo({ top: 350, behavior: 'smooth' });
+    window.scrollTo({ top: 380, behavior: 'smooth' });
   };
 
   return (
     <div className="container">
       <header className="header">
         <h1>Meeting Room Booking System</h1>
-        <span className="utc-badge">All times are in UTC (08:00 - 20:00)</span>
+        <div className="header-badges">
+          <span className="utc-badge">All times are in UTC (08:00 - 20:00)</span>
+          <span className="live-badge">Real-Time Sync Active</span>
+        </div>
       </header>
 
       {globalMessage && <div className="alert-success">{globalMessage}</div>}
@@ -395,6 +458,27 @@ function App() {
 
       <section className="section-box">
         <h2 className="section-title">Create a Booking</h2>
+
+        {selectedRoomObj && (
+          <div className="room-status-banner">
+            <div className="room-status-title">
+              Selected: {selectedRoomObj.name} (Capacity: {selectedRoomObj.capacity}, Floor {selectedRoomObj.floor})
+            </div>
+            <div>
+              <span style={{ fontSize: '0.82rem', color: '#4b5563' }}>Existing Bookings on {formDate}: </span>
+              {formRoomBookings.length === 0 ? (
+                <span className="free-slot-tag">Entire day is currently free</span>
+              ) : (
+                formRoomBookings.map((b) => (
+                  <span key={b.id} className="booked-slot-tag">
+                    {b.start.slice(11, 16)} - {b.end.slice(11, 16)} UTC ({b.title})
+                  </span>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleCreateBooking}>
           <div className="form-grid">
             <div className="form-group">
@@ -452,7 +536,10 @@ function App() {
                 id="booking-date"
                 type="date"
                 value={formDate}
-                onChange={(e) => setFormDate(e.target.value)}
+                onChange={(e) => {
+                  setFormDate(e.target.value);
+                  setSelectedDate(e.target.value);
+                }}
                 required
               />
             </div>
@@ -486,7 +573,23 @@ function App() {
             </div>
           </div>
 
-          <button type="submit" className="btn btn-primary" disabled={formSubmitting}>
+          {liveOverlapConflict && (
+            <div className="alert-error" style={{ marginBottom: '12px' }}>
+              <strong>Conflict Detected:</strong> {selectedRoomObj?.name} is already booked from {liveOverlapConflict.start.slice(11, 16)} to {liveOverlapConflict.end.slice(11, 16)} UTC. No double booking is allowed.
+            </div>
+          )}
+
+          {capacityExceeded && (
+            <div className="alert-error" style={{ marginBottom: '12px' }}>
+              <strong>Capacity Exceeded:</strong> Attendees ({formAttendees}) exceed max room capacity ({selectedRoomObj?.capacity}) for {selectedRoomObj?.name}.
+            </div>
+          )}
+
+          <button
+            type="submit"
+            className="btn btn-primary"
+            disabled={formSubmitting || Boolean(liveOverlapConflict) || capacityExceeded}
+          >
             {formSubmitting ? 'Booking...' : 'Book Room'}
           </button>
 
@@ -504,7 +607,10 @@ function App() {
               id="schedule-date"
               type="date"
               value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
+              onChange={(e) => {
+                setSelectedDate(e.target.value);
+                setFormDate(e.target.value);
+              }}
               style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #d1d5db', fontSize: '0.88rem' }}
             />
           </div>
